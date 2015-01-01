@@ -201,7 +201,7 @@ if (req.http.Accept-Encoding) {
 这段代码设置客客户端发送的 accept-encoding 头只有 gzip 和 default 两种编码,gzip 优先。
 
 #### Pitfall – Vary:User-Agent一些应用或者一些应用服务器发送不同 user-agent 头信息,这让 varnish 为每个单独的用户保存一个单独的信息,这样的信息很多。一个版本相同的浏览器在不同的操作系统 上也会产生最少 10 种不同的 user-agent 头信息。
-所以如果您不打算修改 user-agent,让他们标准 化,您的命中率将受到严重的打击,使用上面的代码做模板。### Purging and banning增加 TTL 值是提高命令率的一个好方法,如果用户访问到的内容是旧的,这样就会对您的商务照成影响。解决方法就是当有新内容提供的时候通知 varnish。可以通过两种机制 HTTP purging 和 bans。首先,我们来解释HTTP purges。* HTTP purges
+所以如果您不打算修改 user-agent,让他们标准 化,您的命中率将受到严重的打击,使用上面的代码做模板。#### Purging and banning增加 TTL 值是提高命令率的一个好方法,如果用户访问到的内容是旧的,这样就会对您的商务照成影响。解决方法就是当有新内容提供的时候通知 varnish。可以通过两种机制 HTTP purging 和 bans。首先,我们来解释HTTP purges。* HTTP purges
 HTTP purges 和 HTTP GET 请求相似,除了这是用来 purges 的。事实上您可以在任何 您喜欢的时间使用这个方法,但是大多数人使用它 purging。Squid 支持相同的机制,为了让 varnish 支持 purging,您需要在 VCL 中做如下配置:
 ```
 acl purge {
@@ -271,4 +271,294 @@ sub vcl_recv {
         }
 }
 ```
-这是一个实用 varnish 的 VCL 处理 ban 的方法。添加一个 ban 在 URL 上,包含它的 主机部分。
+这是一个实用 varnish 的 VCL 处理 ban 的方法。添加一个 ban 在 URL 上,包含它的 主机部分。     
+
+#### Edge Side Includes
+Edge Side Includes 是一种将网页嵌入其他网页的语言。可以把它想象成是在HTTP上工作的HTML包含语句。
+
+在大多数网站上，很多内容是在网页之间共享的。在每个页面上重复生成这些内容太浪费了，ESI试图做到让您为每个片段语句单独设置缓存策略。
+
+在varnish中，我们仅仅实现了ESI的一小部分。在2.1版本中，我们有三种ESI表示方式：
+
+* esi:include
+* esi:remove
+* <!–esi ...–>
+
+Content substitution based on variables and cookies is not implemented but is on the roadmap.
+
+**esi:include示例：**
+
+让我们来看看它如何使用。下面是一个简单的输出日期的CGI脚本：
+
+```
+#!/bin/sh
+echo 'Content-type: text/html'
+echo ''
+date "+%Y-%m-%d %H:%M"
+```
+现在我们创建一个HTML文件，并包含一个ESI嵌套语句：
+
+```
+<HTML>
+	<BODY>
+		The time is: <esi:include src="/cgi-bin/date.cgi"/>
+		at this very moment.
+	</BODY>
+</HTML>
+```
+为了让ESI起作用，你需要在VCL中采用如下方式激活ESI进程：
+
+```
+sub vcl_fetch {
+    if (req.url == "/test.html") {
+       esi;                      /* Do ESI processing               */
+       set obj.ttl = 24 h;       /* Sets the TTL on the HTML above  */
+    } elseif (req.url == "/cgi-bin/date.cgi") {
+       set obj.ttl = 1m;         /* Sets a one minute TTL on        */
+                                 /*  the included object            */
+    }
+}
+```
+**esi remove示例：**
+
+关键词“**remove**”可以让你清除输出。当ESI无效时，你可以用它作为一个备用，就像这样：
+
+```
+<esi:include src="http://www.example.com/ad.html"/>
+<esi:remove>
+  <a href="http://www.example.com">www.example.com</a>
+</esi:remove>
+```
+**<!–esi ... –>示例：**
+这是一个特别的结构，允许HTML用ESI标记而不做渲染，当页面被处理时，ESI进程会移除开始（“<!-esi”）和结束（“->”）标签，同时处理里面的内容。如果页面没有处理，则会变成一个HTML/XML的注释标签：
+
+>\<\!--esi
+><p>Warning: ESI Disabled!</p>
+></p>  -->
+
+这样就确保ESI标记如果没被处理，也不会妨碍最终的HTML的渲染。
+
+## 后端服务器高级配置
+在某些时刻您需要 varnish 从多台服务器上缓存数据。您可能想要 varnish 映射所有的 URL 到一个单独的主机或者不到这个主机。这里很多选项。我们需要引进一个 java 程序进出 php 的 web 站点。假如我们的 java 程序使用的 URL 开 始于/JAVA/我们让它运行在 8000 端口,现在让我们看看默认的 default.vcl:
+```
+backend default {
+    .host = "127.0.0.1";
+    .port = "8080";
+}
+```
+我们添加一个新的 backend:
+
+```
+backend java {
+    .host = "127.0.0.1";
+    .port = "8000";
+}
+```
+
+现在我们需要告诉特殊的 URL 被发送到哪里:
+```
+sub vcl_recv {
+    if (req.url ~ "^/java/") {
+        set req.backend = java;
+    } else {
+        set req.backend = default.
+    }
+}
+```
+这真的很简单,让我们停下来并思考一下。正如您所见,可以通过任意的后端来选 择您要的数据。您想发送移动设备的请求到不同的后端?没问题：`if (req.User-agent ~ /mobile/)...`，应该是这样。。。
+
+## Directors
+
+您可以把多台 backends 聚合成一个组,这些组被叫做 directors。这样可以增强性 能和弹力。您可以定义多个 backends 和多个 group 在同一个 directors。
+```
+backend server1 {
+    .host = "192.168.0.10";
+}
+backend server2{
+    .host = "192.168.0.10";
+}
+```
+现在我们创建一个 director:
+```
+director example_director round-robin {
+{
+        .backend = server1;
+}
+# server2
+{
+        .backend = server2;
+}
+# foo
+}
+```
+这个 director 是一个循环的 director。它的含义就是 director 使用循环的方式把 backends 分给请求。但是如果您的一个服务器宕了?varnish 能否指导所有的请求到健康的后端?当然 可以,这就是健康检查在起作用了。
+## Health checks
+让我们设置一个 包含两个backend和 health checks的director。
+首先定义backends：
+```
+backend server1 {
+  .host = "server1.example.com";
+  .probe = {
+         .url = "/";
+         .interval = 5s;
+         .timeout = 1 s;
+         .window = 5;
+         .threshold = 3;
+    }
+  }
+backend server2 {
+   .host = "server2.example.com";
+   .probe = {
+         .url = "/";
+         .interval = 5s;
+         .timeout = 1 s;
+         .window = 5;
+         .threshold = 3;
+   }
+ }
+ ```
+ 新增了**probe**配置。varnish会用这个probe来检测每一个backend是否健康。它的内部参数有：
+
+参数字段 |说明
+--- | ---
+url | 需要varnish监测的URL
+Timeout | 等待多长时间探针超时
+Window | varnish会运行一个动态变化的窗口，里面显示5个监测结果
+Threshold | 设置最新的监测结果中多少次是正常的，则表示这个backend是健康的
+initial | How many of the of the probes a good when Varnish starts - defaults to the same amount as the threshold.
+    	现在我们定义 director:
+```
+director example_director round-robin {
+	{
+    	.backend = server1;
+    }
+    # server2
+    {
+        .backend = server2;
+    }
+}
+```
+您的站点在您需要的时候使用这个 director,varnish 不会发送流量给标志为不健康的主机。如果所有的 backends都挂了,varnish仍可以使用旧的内容提供服务。参照“Misbehaving servers”获得更多的信息。
+
+请注意，varnish会保持所有加载的VCLs是有效的。varnish会合并相同的probe，所以如果你做很多VCL加载，那要小心不要改变probe的配置。关闭VCL配置，将使probe被丢弃。
+
+## 服务器异常
+
+Varnish 的一个关键特色就是它有能力防御 web 和应用服务器宕机。
+### 优雅模式（Grace mode）当几个客户端请求同一个页面的时候,varnish 只发送一个请求到后端服务器, 然后让那个其他几个请求挂起等待返回结果,返回结果后,复制请求的结果发送给客户 端。如果您的服务每秒有数千万的点击率,那么这个队列是庞大的,没有用户喜欢 等待服务器响应。为了使用过期的 cache 给用户提供服务,我们需要增加他们的 TTL, 保存所有 cache 中的内容在 TTL 过期以后 30 分钟内不删除,使用以下 VCL:
+```
+sub vcl_fetch {
+  set beresp.grace = 30m;
+}
+```
+
+Varnish 还不会使用过期的目标给用户提供服务,所以我们需要配置以下代码,在cache 过期后的 15 秒内,使用旧的内容提供服务:
+```
+sub vcl_recv {
+  set req.grace = 15s;
+}
+```
+你会考虑为什么要多保存过去的内容 30 分钟?当然,如果你启用了`Health checks`,并检测到backend是健康的，就可以设置更长保存时间:
+
+```
+if (! req.backend.healthy) {
+   set req.grace = 5m;
+} else {
+   set req.grace = 15s;
+}
+```
+
+### 神圣模式（saint mode）
+有时候,服务器很古怪,他们发出随机错误,您需要通知 varnish 使用更加优雅的 方式处理它,这种方式叫神圣模式(saint mode)。Saint mode 允许您抛弃一个后端服务器或 者另一个尝试的后端服务器或者 cache 中服务陈旧的内容。
+
+让我们看看 VCL 中如何开启这个 功能的:```
+sub vcl_fetch {
+  if (beresp.status == 500) {
+    set beresp.saintmode = 10s;
+    restart;
+  }
+  set beresp.grace = 5m;
+}
+```
+当我们设置 beresp.saintmode 为 10 秒,varnish 在 10 秒内将不会访问后端服务器 的这个 url。如果有一个备用列表,当重新执行此请求时您有其他的后端有能力提供此服务 内容,varnish 会尝试请求他们,当您没有可用的后端服务器,varnish 将使用它过期的 cache 提供服务内容。它真的是一个救生员。
+### 上帝模式（god mode）
+还没实现。 :-)
+## 进阶篇
+上述教程已经涵盖了基本的varnish内容。如果你通读了上面的内容，那你应该已经掌握了使用varnish的技能。
+这里是对教程中没有涵盖到的内容的一个简短概述章节。
+### 更多VCL
+相比较我们目前讨论的VCL内容，VCL有着更加复杂功能。还有更多的子程序和功能操作我们没有讨论到。关于完整的VCL用法，可以参考帮助页：ref:reference-vcl.
+
+### 使用嵌入式C扩展varnish
+你可以使用嵌入式C扩展varnish。如果你这么做了，当心别玩砸了~。c代码运行在 varnish缓存进程内部,如果您的代码出现错误，缓存将会崩溃。我看到的第一个使用嵌入C的用法是记录日志到 syslog:
+
+```
+# The include statements must be outside the subroutines.
+C{
+        #include <syslog.h>
+}C
+
+sub vcl_something {
+        C{
+                syslog(LOG_INFO, "Something happened at VCL line XX.");
+        }C
+}
+```
+
+### Edge side Includes
+Varnish 可以在 cache 中创建一个 web 页面和其他页面不放在一起,这个片段有个 特殊的缓存策略,如果您的网站有一个列表显示您最受欢迎的 5 篇文章。如果您的网站 有这个页面,您可以制造一个缓存包括其他所有的页面。使用得当,可以大大提高您的 命中率,减少对服务器的负载。ESI 代码如下:
+
+```
+<HTML>
+<BODY>
+The time is: <esi:include src="/cgi-bin/date.cgi"/>
+at this very moment.
+</BODY>
+</HTML>
+```
+ESI 在 vcl_fetch 中通过 `esi` 关键字处理：
+```
+sub vcl_fetch {
+    if (req.url == "/test.html") {
+        esi;  /* Do ESI processing */
+    }
+}
+```
+
+## varnish故障排查
+有时候 varnish 会出错,为了使您知道该检查哪里,您可以检查 varnishlog, /var/log/syslog/,var/log/messages 这里可以发现一些信息,知道 varnish 怎么了。
+### varnish无法启动
+有些时候,varnish 不能启动。这里有很多 varnish 不能启动的原因,通常我们可以 观看/dev/null 的权限和是否其他软件占用了端口。使用 debug 模式启动 varnish,然后观看发生了什么:
+启动varnish：
+`# varnishd -f /usr/local/etc/varnish/default.vcl -s malloc,1G -T 127.0.0.1:2000  -a 0.0.0.0:8080 -d`
+提示-d 选项,它将给您更多的信息关于接下来发生了什么。让我们看看如果其他程序暂用了 varnish 的端口,它将显示什么：
+```
+
+
+# varnishd -n foo -f /usr/local/etc/varnish/default.vcl -s malloc,1G -T 127.0.0.1:2000  -a 0.0.0.0:8080 -d
+storage_malloc: max size 1024 MB.
+Using old SHMFILE
+Platform: Linux,2.6.32-21-generic,i686,-smalloc,-hcritbit
+200 193
+-----------------------------
+Varnish HTTP accelerator CLI.
+-----------------------------
+Type 'help' for command list.
+Type 'quit' to close CLI session.
+Type 'start' to launch worker process.
+
+
+```
+现在 varnish 的主程序已经运行,在 debug 模式中,cache 现在还没有启动,现在 您在终端中使用“start”命令来让主程序开启 cache 功能```
+start
+bind(): Address already in use
+300 22
+Could not open sockets
+```
+在这里,我们发现一个问题。Varnish 要使用的端口被 HTTP 使用了。
+### varnish崩溃
+varnish崩溃
+### Varnish gives me Guru meditation
+首先到varnish的日志中查找相关日志项。那会给你一些线索。
+### varnish未缓存
+请参考“提高命中率”这章。
